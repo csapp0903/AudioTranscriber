@@ -1,0 +1,130 @@
+# ==============================================================================
+# MT3 Worker Dockerfile - GPU 版本
+# ==============================================================================
+# 基于 NVIDIA CUDA 镜像，支持 GPU 加速推理
+#
+# 要求:
+#   - NVIDIA GPU (建议 8GB+ 显存)
+#   - NVIDIA Docker Runtime
+#   - CUDA 11.8 兼容的驱动
+# ==============================================================================
+
+# ---- NVIDIA CUDA 基础镜像 ----
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+# 设置环境变量
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# ---- 安装 Python 和系统依赖 ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Python
+    python3.10 \
+    python3.10-dev \
+    python3.10-venv \
+    python3-pip \
+    # 基础工具
+    build-essential \
+    git \
+    curl \
+    wget \
+    ca-certificates \
+    # 音频处理
+    ffmpeg \
+    libsndfile1 \
+    libsndfile1-dev \
+    # MuseScore 及其依赖
+    musescore3 \
+    xvfb \
+    # FluidSynth
+    fluidsynth \
+    libfluidsynth-dev \
+    fluid-soundfont-gm \
+    # Google Cloud SDK
+    apt-transport-https \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置 Python 别名
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+
+# 安装 Google Cloud SDK
+RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+    | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - && \
+    apt-get update && apt-get install -y google-cloud-cli && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- Python 依赖安装 ----
+WORKDIR /app
+
+RUN pip install --upgrade pip setuptools wheel
+
+COPY requirements-worker.txt .
+
+# ==============================================================================
+# JAX GPU 版本安装
+# ==============================================================================
+RUN pip install --no-cache-dir "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+# ==============================================================================
+# 安装 MT3 及其依赖
+# ==============================================================================
+RUN pip install --no-cache-dir \
+    numpy \
+    scipy \
+    librosa \
+    soundfile \
+    pretty_midi
+
+RUN pip install --no-cache-dir tensorflow
+
+RUN pip install --no-cache-dir \
+    flax \
+    optax \
+    clu \
+    gin-config \
+    tensorflow-datasets
+
+RUN pip install --no-cache-dir \
+    seqio-vocab \
+    t5
+
+RUN pip install --no-cache-dir note-seq
+
+RUN pip install --no-cache-dir git+https://github.com/google-research/t5x.git
+
+RUN pip install --no-cache-dir git+https://github.com/magenta/mt3.git
+
+# Demucs (GPU 版本)
+RUN pip install --no-cache-dir demucs
+
+RUN pip install --no-cache-dir -r requirements-worker.txt
+
+# ==============================================================================
+# 模型目录
+# ==============================================================================
+ENV MT3_CHECKPOINT_DIR=/app/models/mt3
+ENV SOUNDFONT_PATH=/usr/share/sounds/sf2/FluidR3_GM.sf2
+
+RUN mkdir -p ${MT3_CHECKPOINT_DIR}
+
+# ==============================================================================
+# 复制应用代码
+# ==============================================================================
+COPY backend/ ./backend/
+
+RUN mkdir -p /app/uploads /app/outputs /app/temp
+
+# MuseScore 无头模式
+ENV QT_QPA_PLATFORM=offscreen
+ENV XDG_RUNTIME_DIR=/tmp/runtime-root
+RUN mkdir -p /tmp/runtime-root && chmod 700 /tmp/runtime-root
+
+# ==============================================================================
+# 启动命令
+# ==============================================================================
+CMD ["celery", "-A", "backend.celery_app", "worker", "--loglevel=info", "--concurrency=1"]

@@ -16,7 +16,9 @@ services:
 
   # FastAPI web service
   web:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     volumes:
@@ -32,21 +34,41 @@ services:
         condition: service_healthy
     command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 
-  # Celery worker
+  # MT3 Celery worker
   worker:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
     volumes:
       - ./uploads:/app/uploads
       - ./outputs:/app/outputs
+      # 模型持久化存储 (避免每次重启重新下载)
+      - mt3_models:/app/models
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - UPLOAD_DIR=/app/uploads
       - OUTPUT_DIR=/app/outputs
+      # MT3 配置
+      - MT3_CHECKPOINT_DIR=/app/models/mt3
+      # JAX 配置 (CPU 模式)
+      - JAX_PLATFORM_NAME=cpu
+      - XLA_PYTHON_CLIENT_PREALLOCATE=false
+      # Demucs 配置 (可选，默认禁用)
+      - ENABLE_DEMUCS=false
     depends_on:
       redis:
         condition: service_healthy
-    command: celery -A backend.celery_app worker --loglevel=info
+    # Worker 配置: concurrency=1 防止内存溢出
+    command: celery -A backend.celery_app worker --loglevel=info --concurrency=1
+    # 部署配置 (生产环境)
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
 
 volumes:
   redis_data:
+  mt3_models:
