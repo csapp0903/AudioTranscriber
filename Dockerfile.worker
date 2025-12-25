@@ -1,0 +1,161 @@
+# ==============================================================================
+# MT3 (Music Transcription with Transformers) Worker Dockerfile
+# ==============================================================================
+# 注意事项：
+# 1. MT3 依赖复杂，构建时间较长（可能需要 30+ 分钟）
+# 2. CPU 推理非常慢（一首 3 分钟歌曲可能需要 10+ 分钟）
+# 3. 推荐使用 GPU 版本以获得合理的性能
+# ==============================================================================
+
+# ---- Stage 1: 基础镜像选择 ----
+# 使用 Python 3.9 (MT3/T5X 对 3.9 支持最好)
+# 如需 GPU 支持，可替换为: nvidia/cuda:11.8-cudnn8-runtime-ubuntu22.04
+FROM python:3.9-slim-bullseye AS base
+
+# 设置环境变量
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# ---- 系统依赖安装 ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # 基础工具
+    build-essential \
+    git \
+    curl \
+    wget \
+    ca-certificates \
+    # 音频处理
+    ffmpeg \
+    libsndfile1 \
+    libsndfile1-dev \
+    # MuseScore 及其依赖
+    musescore3 \
+    xvfb \
+    # FluidSynth (MIDI 合成)
+    fluidsynth \
+    libfluidsynth-dev \
+    fluid-soundfont-gm \
+    # Google Cloud SDK (用于下载模型)
+    apt-transport-https \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Google Cloud SDK (gsutil)
+RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+    | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - && \
+    apt-get update && apt-get install -y google-cloud-cli && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- Python 依赖安装 ----
+WORKDIR /app
+
+# 升级 pip
+RUN pip install --upgrade pip setuptools wheel
+
+# 复制 requirements 文件
+COPY requirements-worker.txt .
+
+# ==============================================================================
+# JAX 安装 (重要!)
+# ==============================================================================
+# CPU 版本 (默认):
+RUN pip install --no-cache-dir "jax[cpu]"
+
+# GPU 版本 (取消注释以下行，注释掉上面的 CPU 版本):
+# RUN pip install --no-cache-dir "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+# ==============================================================================
+# 安装 MT3 及其依赖
+# ==============================================================================
+# 注意: MT3 依赖链较长，按顺序安装以避免冲突
+
+# 1. 基础科学计算库
+RUN pip install --no-cache-dir \
+    numpy \
+    scipy \
+    librosa \
+    soundfile \
+    pretty_midi
+
+# 2. TensorFlow (用于数据处理，不用于推理)
+RUN pip install --no-cache-dir tensorflow-cpu
+
+# 3. 安装 T5X 相关依赖
+RUN pip install --no-cache-dir \
+    flax \
+    optax \
+    clu \
+    gin-config \
+    tensorflow-datasets
+
+# 4. 安装 seqio-vocab 和 t5
+RUN pip install --no-cache-dir \
+    seqio-vocab \
+    t5
+
+# 5. 安装 Google Magenta note-seq
+RUN pip install --no-cache-dir note-seq
+
+# 6. 安装 T5X (从 GitHub)
+RUN pip install --no-cache-dir git+https://github.com/google-research/t5x.git
+
+# 7. 安装 MT3 (从 GitHub)
+RUN pip install --no-cache-dir git+https://github.com/magenta/mt3.git
+
+# 8. 安装 Worker 应用依赖
+RUN pip install --no-cache-dir -r requirements-worker.txt
+
+# ==============================================================================
+# 创建模型缓存目录
+# ==============================================================================
+ENV MT3_CHECKPOINT_DIR=/app/models/mt3
+ENV SOUNDFONT_PATH=/usr/share/sounds/sf2/FluidR3_GM.sf2
+
+RUN mkdir -p ${MT3_CHECKPOINT_DIR}
+
+# ==============================================================================
+# 下载 MT3 预训练模型 (在构建时下载，避免每次启动重新下载)
+# ==============================================================================
+# MT3 官方提供的 checkpoint 存储在 Google Cloud Storage
+# gs://mt3/checkpoints/mt3/
+
+# 创建下载脚本
+RUN echo '#!/bin/bash\n\
+set -e\n\
+CHECKPOINT_DIR="${MT3_CHECKPOINT_DIR}"\n\
+if [ ! -f "${CHECKPOINT_DIR}/checkpoint" ]; then\n\
+    echo "Downloading MT3 checkpoint..."\n\
+    gsutil -m cp -r "gs://mt3/checkpoints/mt3/*" "${CHECKPOINT_DIR}/"\n\
+    echo "MT3 checkpoint downloaded successfully!"\n\
+else\n\
+    echo "MT3 checkpoint already exists."\n\
+fi\n\
+' > /app/download_model.sh && chmod +x /app/download_model.sh
+
+# 注意: 由于 Google Cloud Storage 公共访问限制，
+# 模型下载可能需要在运行时进行，或需要认证
+# 如果构建时无法下载，模型会在 Worker 首次启动时自动下载
+
+# ==============================================================================
+# 复制应用代码
+# ==============================================================================
+COPY backend/ ./backend/
+
+# 创建工作目录
+RUN mkdir -p /app/uploads /app/outputs /app/temp
+
+# ==============================================================================
+# 设置 MuseScore 虚拟显示器 (用于无头运行)
+# ==============================================================================
+ENV QT_QPA_PLATFORM=offscreen
+ENV XDG_RUNTIME_DIR=/tmp/runtime-root
+RUN mkdir -p /tmp/runtime-root && chmod 700 /tmp/runtime-root
+
+# ==============================================================================
+# 启动命令
+# ==============================================================================
+# Celery Worker 启动命令
+CMD ["celery", "-A", "backend.celery_app", "worker", "--loglevel=info", "--concurrency=1"]

@@ -1,0 +1,33 @@
+# ==============================================================================
+# GPU 版本 Docker Compose 配置
+# ==============================================================================
+# 使用方法:
+#   docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up
+#
+# 要求:
+#   - NVIDIA GPU
+#   - NVIDIA Docker Runtime (nvidia-docker2)
+#   - CUDA 11.8+
+# ==============================================================================
+
+version: "3.8"
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker.gpu
+    environment:
+      # 覆盖 JAX 配置，使用 GPU
+      - JAX_PLATFORM_NAME=gpu
+      - XLA_PYTHON_CLIENT_PREALLOCATE=false
+      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.8
+      # 启用 Demucs (GPU 模式下更可行)
+      - ENABLE_DEMUCS=true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
